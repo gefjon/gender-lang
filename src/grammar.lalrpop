@@ -1,0 +1,31 @@
+use std::str::FromStr;
+use crate::Expr;
+use crate::fsize::Fsize;
+
+grammar;
+
+Boolean: bool = {
+    "true" => true,
+    "false" => false,
+}
+
+Symbol: String = r"[[:alpha:]]\w*" => String::from(<>);
+
+pub Expr: Expr = {
+    If,
+    Let,
+    Boolean => Expr::Boolean(<>),
+    Symbol => Expr::Symbol(<>),
+}
+
+If: Expr = "if" <predicate:Expr> <then_clause:Expr> <else_clause:Expr> => Expr::If {
+        predicate: Box::new(predicate),
+        then_clause: Box::new(then_clause),
+        else_clause: Box::new(else_clause),
+};
+
+Let: Expr = "let" <binding:Symbol> "=" <initial_value:Expr> "in" <body:Expr> => Expr::Let {
+    binding,
+    initial_value: Box::new(initial_value),
+    body: Box::new(body),
+};

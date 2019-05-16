@@ -1,59 +1,21 @@
 #![feature(try_trait)]
 
+use lalrpop_util::lalrpop_mod;
 use std::{collections::HashMap, fmt};
 
-pub mod fsize {
-    //! for, i guess, portability reasons, or something, i've hacked
-    //! together this interface for interacting with pointer-width
-    //! floats, since they can be embedded in an object
+pub mod fsize;
 
-    #[cfg(target_pointer_width = "64")]
-    pub type Fsize = f64;
+pub mod err;
 
-    #[cfg(target_pointer_width = "32")]
-    pub type Fsize = f32;
+lalrpop_mod!(pub grammar);
 
-    #[cfg(not(any(target_pointer_width = "64", target_pointer_width = "32")))]
-    pub type Fsize = compile_error!(
-        "what fucking platform are you on. pointer_width should be either 16 or 32."
-    );
+pub mod genders;
 
-    pub fn to_usize(f: Fsize) -> usize {
-        Fsize::to_bits(f) as usize
-    }
-
-    pub fn from_usize(u: usize) -> Fsize {
-        Fsize::from_bits(u as _)
-    }
-}
-
-pub mod err {
-    use std::{fmt, option::NoneError};
-    pub enum Error {
-        None(NoneError),
-    }
-
-    impl fmt::Debug for Error {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            match self {
-                Error::None(_) => write!(f, "a none error, i guess"),
-            }
-        }
-    }
-
-    impl From<NoneError> for Error {
-        fn from(e: NoneError) -> Error {
-            Error::None(e)
-        }
-    }
-
-    pub type Result<T> = std::result::Result<T, Error>;
-}
-pub struct Method(fn(Object) -> Object);
+pub struct Method {}
 
 impl Method {
-    fn invoke_on<'thread>(&self, obj: Object<'thread>) -> Object<'thread> {
-        (self.0)(obj)
+    fn invoke_on<'thread>(&self, _obj: Object<'thread>) -> Object<'thread> {
+        unimplemented!()
     }
 }
 
@@ -81,24 +43,6 @@ impl PartialEq for Gender {
     }
 }
 
-mod genders {
-    use super::Gender;
-    use lazy_static::lazy_static;
-
-    lazy_static! {
-        pub static ref NUMBER: Gender = Gender {
-            size: 0,
-            name: "number".into(),
-            methods: Default::default(),
-        };
-        pub static ref BOOLEAN: Gender = Gender {
-            size: 0,
-            name: "boolean".into(),
-            methods: Default::default(),
-        };
-    }
-}
-
 #[derive(PartialEq, Debug)]
 /// similar to the way rust represents trait objects as "fat
 /// pointers", gendered objects are two words: a pointer to a `Gender`
@@ -117,6 +61,22 @@ pub struct Object<'thread> {
 impl<'thread> Object<'thread> {
     fn number(n: fsize::Fsize) -> Self {
         make_immediate(&genders::NUMBER, fsize::to_usize(n))
+    }
+    fn try_extract_bool(&self) -> Option<bool> {
+        if self.gender.eq(&genders::BOOLEAN) {
+            Some(self.payload != 0)
+        } else {
+            None
+        }
+    }
+    fn boolean(b: bool) -> Self {
+        make_immediate(&genders::BOOLEAN, b as usize)
+    }
+    unsafe fn shallow_copy(&self) -> Self {
+        Object {
+            gender: self.gender,
+            payload: self.payload,
+        }
     }
 }
 
@@ -163,32 +123,76 @@ pub fn make_immediate(gender: &Gender, payload: usize) -> Object {
     Object { gender, payload }
 }
 
+#[derive(Clone)]
 pub enum Expr {
     Number(fsize::Fsize),
     Boolean(bool),
+    Symbol(String),
     If {
         predicate: Box<Expr>,
-        left: Box<Expr>,
-        right: Box<Expr>,
+        then_clause: Box<Expr>,
+        else_clause: Box<Expr>,
     },
     Let {
         binding: String,
         initial_value: Box<Expr>,
         body: Box<Expr>,
     },
+    /// Halt and Catch Fire - like panic
+    Hcf,
 }
 
 #[derive(Default)]
-pub struct Thread {}
+pub struct Thread<'a> {
+    bindings: Vec<(String, Object<'a>)>,
+}
 
-impl Thread {
-    pub fn eval(&mut self, expr: Expr) -> err::Result<Object> {
-        let o = match expr {
-            Expr::Number(n) => Object::number(n),
-            _ => unimplemented!(),
-        };
+impl<'a> Thread<'a> {
+    pub fn eval(&mut self, expr: Expr) -> err::Result<Object<'a>> {
+        match expr {
+            Expr::Number(n) => Ok(Object::number(n)),
+            Expr::Boolean(b) => Ok(Object::boolean(b)),
+            Expr::Symbol(s) => self
+                .bindings
+                .iter()
+                .rev()
+                .find_map(|(k, v)| if *k == s { Some(v) } else { None })
+                .map(|v| unsafe { v.shallow_copy() })
+                .ok_or(err::Error::UnboundSymbol(s)),
+            Expr::If {
+                predicate,
+                then_clause,
+                else_clause,
+            } => {
+                let pred = {
+                    let pred_result: Object = self.eval(*predicate)?;
+                    pred_result.try_extract_bool()?
+                };
 
-        Ok(o)
+                if pred {
+                    self.eval(*then_clause)
+                } else {
+                    self.eval(*else_clause)
+                }
+            }
+            Expr::Let {
+                binding,
+                initial_value,
+                body,
+            } => {
+                let initial_value = self.eval(*initial_value)?;
+
+                self.bindings.push((binding, initial_value));
+
+                let res = self.eval(*body)?;
+
+                self.bindings.pop().unwrap();
+
+                Ok(res)
+            }
+            Expr::Hcf => Err(err::Hcf),
+            // _ => unimplemented!(),
+        }
     }
 }
 
@@ -219,5 +223,80 @@ mod test {
 
         assert_eq!(fsize::from_usize(obj.payload), 123.456);
         assert_eq!(obj, Object::number(123.456));
+    }
+
+    #[test]
+    fn simple_conditional() {
+        let expr = Expr::If {
+            predicate: Box::new(Expr::Boolean(true)),
+            then_clause: Box::new(Expr::Number(420.69)),
+            else_clause: Box::new(Expr::Hcf),
+        };
+
+        let mut thread = Thread::default();
+
+        let obj = thread.eval(expr).unwrap();
+
+        assert_eq!(obj, Object::number(420.69));
+    }
+
+    #[test]
+    fn halt_and_catch_fire() {
+        let expr = Expr::Hcf;
+        let mut thread = Thread::default();
+
+        let res = thread.eval(expr);
+
+        assert!(res.is_err());
+    }
+    #[test]
+    fn do_a_binding() {
+        let symbol = "foo";
+
+        let expr = Expr::Symbol(symbol.to_string());
+
+        let mut thread = Thread {
+            bindings: vec![(symbol.to_string(), Object::number(123.456))],
+            ..Thread::default()
+        };
+
+        let obj = thread.eval(expr).unwrap();
+
+        assert_eq!(obj, Object::number(123.456));
+    }
+    #[test]
+    fn do_a_let_binding() {
+        let symbol = "foo";
+        let mut thread = Thread::default();
+
+        let unbound_expr = Expr::Symbol(symbol.to_string());
+        let res = thread.eval(unbound_expr.clone());
+        assert!(res.is_err());
+
+        let let_expr = Expr::Let {
+            binding: symbol.to_string(),
+            initial_value: Box::new(Expr::Number(123.456)),
+            body: Box::new(unbound_expr),
+        };
+        let obj = thread.eval(let_expr).unwrap();
+        assert_eq!(obj, Object::number(123.456));
+    }
+    #[test]
+    fn parse_an_if_expr() {
+        let expr = "if true true false";
+        let expr = grammar::ExprParser::new().parse(expr).unwrap();
+
+        let mut thread = Thread::default();
+        let obj = thread.eval(expr).unwrap();
+        assert_eq!(obj, Object::boolean(true));
+    }
+    #[test]
+    fn parse_a_let_expr() {
+        let expr = "let foo = true in foo";
+        let expr = grammar::ExprParser::new().parse(expr).unwrap();
+
+        let mut thread = Thread::default();
+        let obj = thread.eval(expr).unwrap();
+        assert_eq!(obj, Object::boolean(true));
     }
 }
