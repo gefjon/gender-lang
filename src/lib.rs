@@ -7,7 +7,10 @@ pub mod fsize;
 
 pub mod err;
 
-lalrpop_mod!(pub grammar);
+lalrpop_mod!(
+    #[allow(clippy::all)]
+    pub grammar
+);
 
 pub mod genders;
 
