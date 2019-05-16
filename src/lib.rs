@@ -1,48 +1,63 @@
 #![feature(try_trait)]
 
-use std::{collections::HashMap, option::NoneError, fmt};
+use std::{collections::HashMap, fmt};
 
-#[cfg(target_pointer_width = "64")]
-type Fsize = f64;
+pub mod fsize {
+    //! for, i guess, portability reasons, or something, i've hacked
+    //! together this interface for interacting with pointer-width
+    //! floats, since they can be embedded in an object
 
-#[cfg(target_pointer_width = "32")]
-type Fsize = f32;
+    #[cfg(target_pointer_width = "64")]
+    pub type Fsize = f64;
 
-#[cfg(not(any(target_pointer_width = "64", target_pointer_width = "32")))]
-type Fsize = compile_error!("what fucking platform are you on");
+    #[cfg(target_pointer_width = "32")]
+    pub type Fsize = f32;
 
-fn fsize_to_usize(f: Fsize) -> usize {
-    Fsize::to_bits(f) as usize
-}
+    #[cfg(not(any(target_pointer_width = "64", target_pointer_width = "32")))]
+    pub type Fsize = compile_error!(
+        "what fucking platform are you on. pointer_width should be either 16 or 32."
+    );
 
-fn usize_to_fsize(u: usize) -> Fsize {
-    Fsize::from_bits(u as _)
-}
+    pub fn to_usize(f: Fsize) -> usize {
+        Fsize::to_bits(f) as usize
+    }
 
-pub enum Error {
-    None(NoneError),
-}
-
-impl fmt::Debug for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Error::None(_) => write!(f, "a none error, i guess"),
-        }
+    pub fn from_usize(u: usize) -> Fsize {
+        Fsize::from_bits(u as _)
     }
 }
 
-impl From<NoneError> for Error {
-    fn from(e: NoneError) -> Error { Error::None(e) }
-}
+pub mod err {
+    use std::{fmt, option::NoneError};
+    pub enum Error {
+        None(NoneError),
+    }
 
+    impl fmt::Debug for Error {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self {
+                Error::None(_) => write!(f, "a none error, i guess"),
+            }
+        }
+    }
+
+    impl From<NoneError> for Error {
+        fn from(e: NoneError) -> Error {
+            Error::None(e)
+        }
+    }
+
+    pub type Result<T> = std::result::Result<T, Error>;
+}
 pub struct Method(fn(Object) -> Object);
 
 impl Method {
-    fn invoke_on(&self, obj: Object) -> Object {
+    fn invoke_on<'thread>(&self, obj: Object<'thread>) -> Object<'thread> {
         (self.0)(obj)
     }
 }
 
+/// conceptually similar to a typespec or a vtable
 pub struct Gender {
     /// note that `size == 0` denotes an immediate object i.e. no
     /// allocation
@@ -76,7 +91,6 @@ mod genders {
             name: "number".into(),
             methods: Default::default(),
         };
-
         pub static ref BOOLEAN: Gender = Gender {
             size: 0,
             name: "boolean".into(),
@@ -86,12 +100,13 @@ mod genders {
 }
 
 #[derive(PartialEq, Debug)]
-pub struct Object {
-    /// TODO: determine the right pointer type for
-    /// genders. realistically, they should never get freed or
-    /// mutated, so `&'static Gender` seems most correct, but it's
-    /// kinda fucky
-    gender: &'static Gender, 
+/// similar to the way rust represents trait objects as "fat
+/// pointers", gendered objects are two words: a pointer to a `Gender`
+/// and a word of payload. In all of the conceptually interesting
+/// cases, the payload is a pointer to an owned (heap?) allocation of
+/// `gender->size` bytes.
+pub struct Object<'thread> {
+    gender: &'thread Gender,
 
     /// probably a `Box<[u8; gender->size]>` (or a `Box<Self>`,
     /// depending on your perspective), but might be an immediate
@@ -99,19 +114,24 @@ pub struct Object {
     payload: usize,
 }
 
-impl Object {
-    fn number(n: Fsize) -> Object {
-        make_immediate(&genders::NUMBER, fsize_to_usize(n))
+impl<'thread> Object<'thread> {
+    fn number(n: fsize::Fsize) -> Self {
+        make_immediate(&genders::NUMBER, fsize::to_usize(n))
     }
 }
 
-pub fn dynamic_call(obj: Object, method: &str) -> Result<Object, Error> {
+/// look up the `fn(Object) -> Object` named by `method` in `obj`'s
+/// `gender->methods` and invoke it on `obj`
+pub fn dynamic_call<'thread>(
+    obj: Object<'thread>,
+    method: &'thread str,
+) -> err::Result<Object<'thread>> {
     let method = obj.gender.methods.get(method)?;
     let res = method.invoke_on(obj);
     Ok(res)
 }
 
-impl Drop for Object {
+impl<'thread> Drop for Object<'thread> {
     fn drop(&mut self) {
         let Object { gender, payload } = *self;
         if gender.size > 0 {
@@ -124,34 +144,27 @@ impl Drop for Object {
     }
 }
 
-pub fn allocate_object(gender: &'static Gender) -> Object {
+pub fn allocate_object(gender: &Gender) -> Object {
     debug_assert!(gender.size > 0);
-    
+
     let vector = vec![0u8; gender.size];
     let slice = Box::leak(vector.into_boxed_slice());
 
     debug_assert!(slice.len() == gender.size);
-    
+
     let payload = slice.as_mut_ptr() as usize;
 
-    Object {
-        gender,
-        payload,
-    }
-    
+    Object { gender, payload }
 }
 
-pub fn make_immediate(gender: &'static Gender, payload: usize) -> Object {
+pub fn make_immediate(gender: &Gender, payload: usize) -> Object {
     debug_assert!(gender.size == 0);
 
-    Object {
-        gender,
-        payload,
-    }
+    Object { gender, payload }
 }
 
 pub enum Expr {
-    Number(Fsize),
+    Number(fsize::Fsize),
     Boolean(bool),
     If {
         predicate: Box<Expr>,
@@ -169,10 +182,10 @@ pub enum Expr {
 pub struct Thread {}
 
 impl Thread {
-    pub fn eval(&mut self, expr: Expr) -> Result<Object, Error> {
+    pub fn eval(&mut self, expr: Expr) -> err::Result<Object> {
         let o = match expr {
             Expr::Number(n) => Object::number(n),
-            _ => unimplemented!()
+            _ => unimplemented!(),
         };
 
         Ok(o)
@@ -190,11 +203,11 @@ mod test {
             methods: Default::default(),
         }));
         let obj = allocate_object(gender);
-        
+
         assert_eq!(
             obj.gender as *const Gender as usize,
             gender as *const Gender as usize
-        );        
+        );
     }
 
     #[test]
@@ -204,7 +217,7 @@ mod test {
 
         let obj = thread.eval(expr).unwrap();
 
-        assert_eq!(usize_to_fsize(obj.payload), 123.456);
+        assert_eq!(fsize::from_usize(obj.payload), 123.456);
         assert_eq!(obj, Object::number(123.456));
     }
 }
