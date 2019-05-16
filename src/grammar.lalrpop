@@ -12,6 +12,7 @@ Symbol: String = r"[[:alpha:]]\w*" => String::from(<>);
 pub Expr: Expr = {
     If,
     Let,
+    Do,
     Boolean => Expr::Boolean(<>),
     Symbol => Expr::Symbol(<>),
 }
@@ -26,4 +27,9 @@ Let: Expr = "let" <binding:Symbol> "=" <initial_value:Expr> "in" <body:Expr> => 
     binding,
     initial_value: Box::new(initial_value),
     body: Box::new(body),
+};
+
+Do: Expr = "{" <body:(<Expr> ";")*> <finally:Expr> "}" => Expr::Do {
+    body,
+    finally: Box::new(finally),
 };

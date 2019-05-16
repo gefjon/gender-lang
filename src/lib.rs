@@ -141,6 +141,10 @@ pub enum Expr {
         initial_value: Box<Expr>,
         body: Box<Expr>,
     },
+    Do {
+        body: Vec<Expr>,
+        finally: Box<Expr>,
+    },
     /// Halt and Catch Fire - like panic
     Hcf,
 }
@@ -193,8 +197,13 @@ impl<'a> Thread<'a> {
 
                 Ok(res)
             }
+            Expr::Do { body, finally } => {
+                for expr in body {
+                    self.eval(expr)?;
+                }
+                self.eval(*finally)
+            }
             Expr::Hcf => Err(err::Hcf),
-            // _ => unimplemented!(),
         }
     }
 }
@@ -296,6 +305,15 @@ mod test {
     #[test]
     fn parse_a_let_expr() {
         let expr = "let foo = true in foo";
+        let expr = grammar::ExprParser::new().parse(expr).unwrap();
+
+        let mut thread = Thread::default();
+        let obj = thread.eval(expr).unwrap();
+        assert_eq!(obj, Object::boolean(true));
+    }
+    #[test]
+    fn parse_a_do_expr() {
+        let expr = "{true; false; true}";
         let expr = grammar::ExprParser::new().parse(expr).unwrap();
 
         let mut thread = Thread::default();
